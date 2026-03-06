@@ -753,8 +753,8 @@ class Invoice(Document):
 		# previously we used to cancel and re-apply credits, but it messed up the balance transaction history
 		# so now we only do append-only operation while applying credits
 
-		balance = frappe.get_cached_doc("Team", self.team).get_balance()
-		if balance <= 0:
+		available_balance = frappe.get_cached_doc("Team", self.team).get_balance()
+		if available_balance <= 0:
 			return
 
 		unallocated_balances = frappe.db.get_all(
@@ -773,21 +773,23 @@ class Invoice(Document):
 
 		total_allocated = 0
 		due = self.amount_due
-		for balance in unallocated_balances:
-			if due == 0:
+		for bt in unallocated_balances:
+			if due == 0 or available_balance <= 0:
 				break
-			allocated = min(due, balance.unallocated_amount)
+			# Ensure we don't allocate more than the actual available team balance
+			allocated = min(due, bt.unallocated_amount, available_balance)
 			due -= allocated
+			available_balance -= allocated
 			self.append(
 				"credit_allocations",
 				{
-					"transaction": balance.name,
+					"transaction": bt.name,
 					"amount": allocated,
 					"currency": self.currency,
-					"source": balance.source,
+					"source": bt.source,
 				},
 			)
-			doc = frappe.get_doc("Balance Transaction", balance.name)
+			doc = frappe.get_doc("Balance Transaction", bt.name)
 			doc.append(
 				"allocated_to",
 				{"invoice": self.name, "amount": allocated, "currency": self.currency},
