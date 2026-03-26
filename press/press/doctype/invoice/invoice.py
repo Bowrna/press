@@ -78,13 +78,14 @@ class Invoice(Document):
 		next_payment_attempt_date: DF.Date | None
 		partner_email: DF.Data | None
 		payment_attempt_count: DF.Int
-		payment_attempt_date: DF.Date | None
+		payment_attempt_date: DF.Datetime | None
 		payment_date: DF.Date | None
 		payment_mode: DF.Literal[
 			"", "Card", "Prepaid Credits", "NEFT", "Partner Credits", "Paid By Partner", "UPI Autopay"
 		]
 		period_end: DF.Date | None
 		period_start: DF.Date | None
+		razorpay_mandate_id: DF.Link | None
 		razorpay_order_id: DF.Data | None
 		razorpay_payment_id: DF.Data | None
 		razorpay_payment_method: DF.Data | None
@@ -501,8 +502,7 @@ class Invoice(Document):
 		if not mandate:
 			return
 
-		amount = int(self.amount_due_with_tax * 100)  # Convert to paise
-		self._make_razorpay_payment(mandate, amount)
+		self._make_razorpay_payment(mandate)
 
 	def _check_existing_razorpay_payment(self):
 		"""Check if an already-created Razorpay payment has been captured"""
@@ -555,26 +555,45 @@ class Invoice(Document):
 
 		return mandate
 
-	def _make_razorpay_payment(self, mandate, amount):
-		"""Create recurring payment using Razorpay mandate token"""
+	def _make_razorpay_payment(self, mandate=None, retry=False):
+		"""Create (or retry) a recurring payment using Razorpay mandate token.
+
+		On first attempt (retry=False): mandate must be passed; creates a new Razorpay order.
+		On retry (retry=True): fetches the original mandate from razorpay_mandate_id to ensure
+		the same token/customer is used with the existing order.
+		"""
+		if retry:
+			mandate = frappe.db.get_value(
+				"Razorpay Mandate",
+				self.razorpay_mandate_id,
+				["name", "token_id", "razorpay_customer_id", "max_amount", "contact", "upi_vpa"],
+				as_dict=True,
+			)
+			if not mandate:
+				return None
+
+		amount = int(self.amount_due_with_tax * 100)  # Convert to paise
 		try:
 			client = get_razorpay_client()
 
-			# Create an order for the recurring payment
-			# Ref: https://razorpay.com/docs/api/payments/recurring-payments/upi/create-subsequent-payments/
-			order = client.order.create(
-				{
-					"amount": amount,
-					"currency": "INR",
-					"receipt": self.name,
-					"notes": {
-						"invoice": self.name,
-						"team": self.team,
-						"mandate": mandate.name,
-					},
-				}
-			)
-			order_id = order.get("id")
+			if retry:
+				order_id = self.razorpay_order_id
+			else:
+				# Create an order for the recurring payment
+				# Ref: https://razorpay.com/docs/api/payments/recurring-payments/upi/create-subsequent-payments/
+				order = client.order.create(
+					{
+						"amount": amount,
+						"currency": "INR",
+						"receipt": self.name,
+						"notes": {
+							"invoice": self.name,
+							"team": self.team,
+							"mandate": mandate.name,
+						},
+					}
+				)
+				order_id = order.get("id")
 
 			payment = client.payment.createRecurring(
 				{
@@ -595,34 +614,36 @@ class Invoice(Document):
 				}
 			)
 
-			self.db_set(
-				{
-					"razorpay_order_id": order_id,
-					"razorpay_payment_id": payment.get("razorpay_payment_id"),
-					"razorpay_payment_method": "emandate",
-					"status": "Invoice Created",
-				},
-				commit=True,
-			)
+			updates = {
+				"razorpay_payment_id": payment.get("razorpay_payment_id"),
+				"payment_attempt_date": frappe.utils.now_datetime(),
+				"status": "Invoice Created",
+			}
+			if not retry:
+				updates["razorpay_order_id"] = order_id
+				updates["razorpay_payment_method"] = "emandate"
+				updates["razorpay_mandate_id"] = mandate.name
+
+			self.db_set(updates, commit=True)
 			self.reload()
 			return payment
 		except Exception:
 			frappe.db.rollback()
 			self.reload()
 
-			# Log the traceback as comment
 			msg = "<pre><code>" + frappe.get_traceback() + "</pre></code>"
 			self.add_comment("Comment", _("Razorpay Payment Creation Failed") + "<br><br>" + msg)
-			self.db_set(
-				{
-					"payment_attempt_count": (self.payment_attempt_count or 0) + 1,
-					"payment_attempt_date": frappe.utils.today(),
-				},
-				commit=False,
-			)
-			frappe.get_doc("Team", self.team).send_email_for_failed_upi_payment(
-				self, error_reason="PAYMENT_CREATION_FAILED"
-			)
+			if not retry:
+				self.db_set(
+					{
+						"payment_attempt_count": (self.payment_attempt_count or 0) + 1,
+						"payment_attempt_date": frappe.utils.now_datetime(),
+					},
+					commit=False,
+				)
+				frappe.get_doc("Team", self.team).send_email_for_failed_upi_payment(
+					self, error_reason="PAYMENT_CREATION_FAILED"
+				)
 			frappe.db.commit()
 
 	def get_razorpay_payment_description(self):
@@ -1311,7 +1332,7 @@ def finalize_razorpay_mandate_invoices():
 			"payment_mode": "UPI Autopay",
 			"razorpay_payment_id": ("is", "set"),
 		},
-		fields=["name", "razorpay_payment_id"],
+		fields=["name", "razorpay_payment_id", "payment_attempt_date"],
 	)
 	for inv in invoices:
 		try:
@@ -1332,22 +1353,25 @@ def finalize_razorpay_mandate_invoices():
 				frappe.db.commit()
 
 			elif payment_status == "failed":
-				# Razorpay's API returns "failed" only after the transaction is definitively
-				# closed (including the 25-hour UPI capture window). Reset the invoice to
-				# Unpaid so the user can pay manually. No automatic retry — attempting another
-				# debit via the same monthly mandate would hit FREQUENCY_LIMIT_EXCEEDED or
-				# could violate the user's max_amount if combined with the next month's invoice.
+				# Razorpay confirms payment status (captured or failed) within 48 hours.
+				# Only retry if the payment was initiated more than 48 hours ago.
+				# Retry reuses the same order_id and payment_id as advised by Razorpay.
+				hours_since_attempt = (
+					frappe.utils.time_diff_in_hours(frappe.utils.now_datetime(), inv.payment_attempt_date)
+					if inv.payment_attempt_date
+					else 49
+				)
+				if hours_since_attempt < 48:
+					continue
+
 				invoice = frappe.get_doc("Invoice", inv.name, for_update=True)
 				invoice.payment_attempt_count = (invoice.payment_attempt_count or 0) + 1
-				invoice.payment_attempt_date = frappe.utils.today()
-				invoice.razorpay_payment_id = None
-				invoice.razorpay_order_id = None
-				invoice.status = "Unpaid"
+				invoice.payment_attempt_date = frappe.utils.now_datetime()
 				invoice.save(ignore_permissions=True)
-				frappe.get_doc("Team", invoice.team).send_email_for_failed_upi_payment(
-					invoice, error_reason=payment.get("error_reason", "")
-				)
 				frappe.db.commit()
+
+				# Retry with same order_id and original mandate as advised by Razorpay
+				invoice._make_razorpay_payment(retry=True)
 
 		except Exception:
 			frappe.db.rollback()

@@ -209,7 +209,10 @@
 							<TextInsideCircle>4</TextInsideCircle>
 							<span
 								class="text-base font-medium"
-								v-if="$team.doc.payment_mode === 'Card'"
+								v-if="
+									$team.doc.payment_mode === 'Card' ||
+									$team.doc.payment_mode === 'UPI Autopay'
+								"
 							>
 								Automatic billing setup completed
 							</span>

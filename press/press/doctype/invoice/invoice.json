@@ -64,6 +64,7 @@
   "transaction_fee_details",
   "razorpay_billing_section",
   "razorpay_order_id",
+  "razorpay_mandate_id",
   "razorpay_payment_record",
   "column_break_44",
   "razorpay_payment_id",
@@ -230,7 +231,7 @@
   {
    "allow_on_submit": 1,
    "fieldname": "payment_attempt_date",
-   "fieldtype": "Date",
+   "fieldtype": "Datetime",
    "label": "Payment Attempt Date",
    "no_copy": 1
   },
@@ -524,6 +525,12 @@
    "fieldtype": "Check",
    "hidden": 1,
    "label": "Budget Alert Sent"
+  },
+  {
+   "fieldname": "razorpay_mandate_id",
+   "fieldtype": "Link",
+   "label": "Razorpay Mandate ID",
+   "options": "Razorpay Mandate"
   }
  ],
  "grid_page_length": 50,
@@ -550,7 +557,7 @@
    "link_fieldname": "invoice"
   }
  ],
- "modified": "2026-03-09 15:59:12.085407",
+ "modified": "2026-03-25 17:12:42.569592",
  "modified_by": "Administrator",
  "module": "Press",
  "name": "Invoice",
