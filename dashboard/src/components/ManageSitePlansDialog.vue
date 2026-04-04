@@ -200,12 +200,11 @@ export default {
 		handleNext() {
 			if (
 				!this.$team.doc.billing_details ||
-				!Object.keys(this.$team.doc.billing_details).length
+				!Object.keys(this.$team.doc.billing_details).length ||
+				!this.$team.doc.payment_mode
 			) {
-				this.step = 'billing-details';
-				this.$team.reload();
-			} else if (!this.$team.doc.payment_mode) {
-				this.step = 'add-payment-mode';
+				this.show = false;
+				this.$router.push('/billing');
 			} else {
 				this.changePlan();
 			}
